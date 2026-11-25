@@ -104,6 +104,18 @@
 #define configUSE_OS2_TIMER                  1
 #define configUSE_OS2_MUTEX                  1
 
+#define configGENERATE_RUN_TIME_STATS 1
+
+/* Run-time counter functions implemented in main.c */
+extern void PG_RuntimeStatsInit(void);
+extern uint32_t PG_RuntimeStatsCounter(void);
+
+#define portCONFIGURE_TIMER_FOR_RUN_TIME_STATS() \
+    PG_RuntimeStatsInit()
+
+#define portGET_RUN_TIME_COUNTER_VALUE() \
+    PG_RuntimeStatsCounter()
+
 /* Set the following definitions to 1 to include the API function, or zero
 to exclude the API function. */
 #define INCLUDE_vTaskPrioritySet             1

@@ -38,17 +38,58 @@
 #define PG_AUDIO_HALF 256U
 #define PG_AUDIO_SIZE 512U
 #define PG_GHOST_MAX 9000U /* 5 minutes at 30 Hz */
-#define PG_TRAFFIC_MAX 9U
+#define PG_TRAFFIC_MAX 64U /* storage for multiple rows of 2..7 cars */
 #define PG_SCORE_COUNT 5U
 #define PG_TICK_SENSOR_HZ 100U
 #define PG_TICK_GAME_HZ 30U
 #define PG_TICK_RENDER_HZ 30U
+
+/* ===== TRAFFIC DIFFICULTY - EDIT THESE VALUES =====
+ * Each spawn event adds 2 cars initially, then ramps toward 5.
+ * Max cars per event must be <=7: the road is 29 characters wide,
+ * vehicles are 3 characters wide, and a visible gap is kept between them.
+ * 30 game frames = about 1 second while RUNNING.
+ * The traffic movement rates below are independent of spawn frequency. */
+#define PG_TRAFFIC_START_CARS               2U
+#define PG_TRAFFIC_MAX_CARS_PER_SPAWN       5U   /* change to 6 or 7 */
+#define PG_TRAFFIC_CARS_RAMP_FRAMES        180U   /* +1 car every 6 s */
+#define PG_TRAFFIC_START_INTERVAL_FRAMES   17U
+#define PG_TRAFFIC_MIN_INTERVAL_FRAMES      6U
+#define PG_TRAFFIC_INTERVAL_RAMP_FRAMES   150U   /* interval -1 every 5 s */
+
+/* Obstacle movement follows throttle: at SPEED=0 still 10 rows/s,
+ * reaching 30 rows/s at SPEED=100. Maximum must be <= 30 (game Hz)
+ * so each frame moves at most one row, avoiding skipped collisions. */
+#define PG_TRAFFIC_MIN_ROWS_PER_SEC         10U   /* SPEED=0 */
+#define PG_TRAFFIC_MAX_ROWS_PER_SEC         30U   /* SPEED=100 */
+#define PG_RESET_HOLD_MS 3000U
+
+#if (PG_TRAFFIC_START_CARS < 1U) || (PG_TRAFFIC_MAX_CARS_PER_SPAWN < PG_TRAFFIC_START_CARS) || (PG_TRAFFIC_MAX_CARS_PER_SPAWN > 7U)
+#error "PG_TRAFFIC_START_CARS/MAX_CARS_PER_SPAWN must be between 1 and 7"
+#endif
+#if (PG_TRAFFIC_CARS_RAMP_FRAMES == 0U) || (PG_TRAFFIC_INTERVAL_RAMP_FRAMES == 0U)
+#error "Traffic ramp periods must be nonzero"
+#endif
+#if (PG_TRAFFIC_MIN_INTERVAL_FRAMES < 4U) || (PG_TRAFFIC_START_INTERVAL_FRAMES < PG_TRAFFIC_MIN_INTERVAL_FRAMES)
+#error "Traffic spawn interval must be at least 4 frames and start >= minimum"
+#endif
+#if (PG_TRAFFIC_MIN_ROWS_PER_SEC > PG_TRAFFIC_MAX_ROWS_PER_SEC) || (PG_TRAFFIC_MAX_ROWS_PER_SEC > PG_TICK_GAME_HZ)
+#error "Traffic rows/sec must be ordered and at most the game update rate"
+#endif
 
 /* Tunable algorithm settings. */
 #define PG_KALMAN_Q 0.06f
 #define PG_KALMAN_R 1.0f
 #define PG_STEER_DEG_RANGE 28.0f
 #define PG_SENSOR_CALIBRATION_SAMPLES 64U
+/* One-shot manual Kalman step experiment; 100-Hz sensor loop. */
+#define PG_STEP_SETTLE_SAMPLES 60U     /* Ignore 0.6s after calibration. */
+#define PG_STEP_BASELINE_SAMPLES 100U  /* Estimate neutral for 1.0s. */
+#define PG_STEP_TRIGGER_DEG 6.0f      /* Detect deliberate tilt. */
+#define PG_STEP_MIN_AMPLITUDE_DEG 12.0f
+#define PG_STEP_CAPTURE_SAMPLES 150U  /* Observe 1.5s after movement. */
+#define PG_STEP_PLATEAU_SAMPLES 20U   /* Hold tilt during last 0.2s. */
+#define PG_STEP_PLATEAU_SPAN_DEG 3.0f /* Reject a moving final target. */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -77,6 +118,9 @@ typedef struct {
     int8_t playerX, ghostX;
     uint16_t speed;
     uint32_t score, frame, seed;
+    /* Fractional progress: score and road scrolling follow forward speed. */
+    uint32_t scoreRemainder, roadRemainder, roadOffset;
+    uint32_t trafficRemainder; /* fixed-point obstacle row movement */
     uint32_t scores[PG_SCORE_COUNT];
     PG_Car traffic[PG_TRAFFIC_MAX];
     uint32_t sensorTick;
@@ -158,7 +202,7 @@ DMA_HandleTypeDef hdma_usart1_tx;
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 128 * 4,
+  .stack_size = 2048,
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* Definitions for audioTask */
@@ -210,6 +254,10 @@ volatile uint8_t pgFlashMapped = 0, pgFlashReady = 0;
 volatile uint32_t pgAudioRefills = 0, pgAudioLate = 0, pgAudioUnderruns = 0;
 volatile uint32_t pgAudioStartError = 0, pgSensorErrors = 0, pgSensorReadings = 0;
 volatile uint32_t pgGameFrames = 0, pgRenderFrames = 0, pgUartErrors = 0;
+/* Current traffic tuning values for STM32CubeIDE Live Expressions. */
+volatile uint32_t pgSpawnIntervalFrames = 0U;
+volatile uint32_t pgCarsPerSpawn = 0U;
+volatile uint32_t pgTrafficRowsPerSecX100 = 0U;
 volatile uint32_t pgFlashErrors = 0, pgSavedGames = 0, pgTiltToScreenMs = 0;
 /* Flash boot diagnostics, visible in PuTTY and the debugger.
  * Step identifies the last attempted phase; FailStep + FailOp identify
@@ -223,12 +271,31 @@ volatile uint32_t pgAvgFpsX100 = 0;
 volatile float pgRollRawVariance = 0, pgRollFilteredVariance = 0;
 volatile float pgPitchRawVariance = 0, pgPitchFilteredVariance = 0;
 volatile uint32_t pgReplayMismatch = 0;
+/* Kalman step test (read these in STM32CubeIDE Live Expressions).
+ * pgStepStatus: 0=settling/baseline, 1=armed, 2=capturing,
+ *               3=completed, 4=rejected (check pgStepError).
+ * pgStepAxis: 1=roll, 2=pitch.  pgStepError:
+ * 1=tilt amplitude too small, 2=target not held, 3=90% not reached.
+ * Set pgStepResetRequest=1 in debugger to arm another trial.
+ */
+volatile uint32_t pgStepStatus = 0U, pgStepAxis = 0U, pgStepError = 0U;
+volatile uint32_t pgStepSamples = 0U, pgStepRawT90Ms = 0U;
+volatile uint32_t pgStepFilteredT90Ms = 0U;
+volatile int32_t pgStepLagMs = 0;
+volatile float pgStepAmplitudeDeg = 0.0f;
+volatile uint32_t pgStepResetRequest = 0U;
+/* 0=normal, 1=reset queued/in progress, 2=reset committed, 3=reset failed. */
+volatile uint8_t pgRecordsResetState = 0U;
 PG_Tilt pgTiltLog[512];
 volatile uint32_t pgTiltLogHead = 0;
 volatile uint8_t pgCpuPercent[5] = {0};
 static PG_View pgView;
 static PG_Save pgCurrentSave; /* score table and best-run trace */
+/* Each recorded position uses its high bit for whether traffic moved on
+ * that frame. Column is stored in the low 7 bits (26..54). Old records
+ * have no high bits and still replay using the legacy fixed motion. */
 static int8_t pgCurrentRun[PG_GHOST_MAX];
+static uint8_t pgReplayMovesEncoded = 0U;
 static uint16_t pgAudioBuffer[PG_AUDIO_SIZE] __attribute__((aligned(4)));
 static uint32_t pgCurrentCount = 0;
 static uint32_t pgCurrentHash = 2166136261UL;
@@ -339,12 +406,21 @@ void PG_GameReset(PG_View *v, uint32_t seed, PG_Mode mode)
     v->ghostFrameCount = ghostLength;
 }
 
-/* Traffic is a seeded function of frame number, independent of tilt input.
- * This ensures traffic can be reconstructed when replaying the best run. */
+/* Spawn patterns depend on seed + frame; the recorded high bit of each
+ * ghost position stores speed-dependent row motion for exact reconstruction. */
 static uint32_t pg_frame_random(uint32_t seed, uint32_t frame)
 {
     uint32_t state = seed ^ (frame * 0x9E3779B9U);
     return pg_random(&state);
+}
+
+static uint8_t PG_ReplayHasMoveFlags(const int8_t *positions, uint32_t count)
+{
+    if (!positions) return 0U;
+    if (count > PG_GHOST_MAX) count = PG_GHOST_MAX;
+    for (uint32_t i = 0U; i < count; ++i)
+        if (((uint8_t)positions[i] & 0x80U) != 0U) return 1U;
+    return 0U;
 }
 
 void PG_GameStep(PG_View *v, const PG_Tilt *tilt, const int8_t *replay,
@@ -365,48 +441,121 @@ void PG_GameStep(PG_View *v, const PG_Tilt *tilt, const int8_t *replay,
         if (ratio > 1.0f) ratio = 1.0f;
         if (ratio < -1.0f) ratio = -1.0f;
         v->playerX = (int8_t)pg_clamp(40 + (int32_t)(ratio * 14.0f), 26, 54);
-        v->speed = (uint16_t)pg_clamp(40 - (int32_t)(tilt->pitch * 2.0f), 0, 100);
+        /* For this board mounting orientation: forward tilt accelerates. */
+        v->speed = (uint16_t)pg_clamp(40 + (int32_t)(tilt->pitch * 2.0f), 0, 100);
     }
     if (v->mode == PG_REPLAY) {
         if (v->frame >= replayLength || replay == NULL) {
             v->mode = PG_MENU;
             return;
         }
-        v->playerX = replay[v->frame];
+        /* Mask the high bit: on new recordings it stores obstacle motion.
+         * Legacy recordings contain plain positions (no high bit set). */
+        v->playerX = (int8_t)((uint8_t)replay[v->frame] & 0x7FU);
         v->ghostX = v->playerX;
-        v->speed = 60; /* visual replay only; traffic timing depends on frame */
-    } else if (record && recordCount && *recordCount < PG_GHOST_MAX) {
-        record[*recordCount] = v->playerX;
-        ++*recordCount;
+        v->speed = 60; /* display/audio only; replay uses saved obstacle steps */
     }
-    /* Every frame advances traffic, with density increasing over time. */
-    uint32_t spawnInterval = (v->frame / 600U < 8U) ? (17U - v->frame / 600U) : 9U;
+    /* At 30 game frames/sec, an integer accumulator yields 10..30 obstacle
+     * rows/sec according to the current throttle, even as tilt changes.
+     * Recording the movement bit keeps ghost obstacles identical on replay. */
+    uint8_t trafficAdvance = 0U;
+    if (v->mode == PG_REPLAY) {
+        if (pgReplayMovesEncoded) {
+            trafficAdvance = (((uint8_t)replay[v->frame] & 0x80U) != 0U);
+        } else {
+            /* Backward-compatible replay of ghosts saved by old firmware. */
+            trafficAdvance = (v->frame % 3U) < 2U;
+        }
+    } else {
+        uint32_t motion = 100U * PG_TRAFFIC_MIN_ROWS_PER_SEC +
+            (uint32_t)v->speed *
+                (PG_TRAFFIC_MAX_ROWS_PER_SEC - PG_TRAFFIC_MIN_ROWS_PER_SEC);
+        pgTrafficRowsPerSecX100 = motion; /* e.g., 2000 means 20.00 rows/s */
+        v->trafficRemainder += motion;
+        if (v->trafficRemainder >= 100U * PG_TICK_GAME_HZ) {
+            v->trafficRemainder -= 100U * PG_TICK_GAME_HZ;
+            trafficAdvance = 1U;
+        }
+        if (record && recordCount && *recordCount < PG_GHOST_MAX) {
+            /* Pack X (0..127) + traffic-step bit into one signed byte.
+             * Existing 16-KiB CRC-protected flash layout is unchanged. */
+            record[*recordCount] = (int8_t)((uint8_t)v->playerX |
+                                        (trafficAdvance ? 0x80U : 0U));
+            ++*recordCount;
+        }
+    }
+    /* Road markers reflect distance travelled. When stopped, road motion stops,
+     * while oncoming traffic still moves independently toward the player. */
+    v->roadRemainder += (uint32_t)v->speed;
+    v->roadOffset += v->roadRemainder / 50U;
+    v->roadRemainder %= 50U;
+
+    /* Seeded traffic: start with 2 cars, grow to configurable 5..7 cars,
+     * and shrink the spawn interval more quickly. Both ramps are based on
+     * game frames, not wall time, and so remain deterministic on replay. */
+    uint32_t carsPerSpawn = PG_TRAFFIC_START_CARS +
+        v->frame / PG_TRAFFIC_CARS_RAMP_FRAMES;
+    if (carsPerSpawn > PG_TRAFFIC_MAX_CARS_PER_SPAWN)
+        carsPerSpawn = PG_TRAFFIC_MAX_CARS_PER_SPAWN;
+
+    uint32_t intervalDrop = v->frame / PG_TRAFFIC_INTERVAL_RAMP_FRAMES;
+    uint32_t maxDrop = PG_TRAFFIC_START_INTERVAL_FRAMES -
+                       PG_TRAFFIC_MIN_INTERVAL_FRAMES;
+    if (intervalDrop > maxDrop) intervalDrop = maxDrop;
+    uint32_t spawnInterval = PG_TRAFFIC_START_INTERVAL_FRAMES - intervalDrop;
+    if (v->mode == PG_RUNNING) {
+        pgSpawnIntervalFrames = spawnInterval;
+        pgCarsPerSpawn = carsPerSpawn;
+    }
     if ((v->frame % spawnInterval) == 0U) {
-        uint32_t dice = pg_frame_random(v->seed, v->frame);
-        unsigned slot = PG_TRAFFIC_MAX;
-        for (unsigned j = 0; j < PG_TRAFFIC_MAX; j++) {
-            if (v->traffic[j].y < 0) { slot = j; break; }
-        }
-        if (slot < PG_TRAFFIC_MAX) {
-            v->traffic[slot].x = (int8_t)(30 + 10 * (dice % 3U));
+        uint32_t randomState = pg_frame_random(v->seed, v->frame);
+        /* All cars in one event occupy the same row. Place their centres
+         * in 27..53 with >=4 columns of separation, so 3-character sprites
+         * never overlap and at least one blank column remains between them.
+         * Distribute remaining space pseudorandomly across the entire road. */
+        uint32_t space = 26U - 4U * (carsPerSpawn - 1U);
+        uint32_t lead = pg_random(&randomState) % (space + 1U);
+        uint32_t column = 27U + lead;
+        space -= lead;
+        for (uint32_t which = 0U; which < carsPerSpawn; ++which) {
+            if (which != 0U) {
+                uint32_t extra = pg_random(&randomState) % (space + 1U);
+                column += 4U + extra;
+                space -= extra;
+            }
+            unsigned slot = PG_TRAFFIC_MAX;
+            for (unsigned j = 0; j < PG_TRAFFIC_MAX; ++j) {
+                if (v->traffic[j].y < 0) { slot = j; break; }
+            }
+            if (slot >= PG_TRAFFIC_MAX) break;
+            v->traffic[slot].x = (int8_t)column;
             v->traffic[slot].y = 3;
-            v->traffic[slot].kind = (uint8_t)((dice >> 8) % 3U);
+            v->traffic[slot].kind = (uint8_t)(pg_random(&randomState) % 3U);
         }
     }
-    for (unsigned j = 0; j < PG_TRAFFIC_MAX; j++) {
+    for (unsigned j = 0; j < PG_TRAFFIC_MAX; ++j) {
         PG_Car *c = &v->traffic[j];
         if (c->y < 0) continue;
-        /* Ignore spawn row on spawn frame and move all traffic one row/frame. */
-        c->y += 1;
+        /* Every active obstacle uses the same speed-dependent row step. */
+        if (trafficAdvance) c->y += 1;
         if (c->y >= 22) { c->y = -1; continue; }
-        if (v->mode == PG_RUNNING && c->y >= 19 && c->y <= 21 &&
-            (int32_t)v->playerX >= (int32_t)c->x - 2 &&
-            (int32_t)v->playerX <= (int32_t)c->x + 2) {
+        /* The player is drawn as 'A' at row 20. Traffic is rendered as
+         * '[X]' or '[V]' (centre x, visible columns x-1..x+1).
+         * Detect visible character overlap only; the former 3-row / +/-2
+         * box caused collisions before the vehicles appeared to touch. */
+        if (v->mode == PG_RUNNING && c->y == 20 &&
+            (int32_t)v->playerX >= (int32_t)c->x - 1 &&
+            (int32_t)v->playerX <= (int32_t)c->x + 1) {
             v->mode = PG_GAME_OVER;
             v->collision = 1;
         }
     }
-    if (v->mode == PG_RUNNING) v->score += (1U + v->speed / 10U);
+    /* Award distance-based points. At speed zero, no score is earned. */
+    if (v->mode == PG_RUNNING) {
+        v->scoreRemainder += (uint32_t)v->speed;
+        v->score += v->scoreRemainder / 10U;
+        v->scoreRemainder %= 10U;
+    }
     if (runHash) {
         *runHash = PG_SeedHash(*runHash, (uint8_t)v->playerX);
         *runHash = PG_SeedHash(*runHash, pg_frame_random(v->seed, v->frame));
@@ -941,7 +1090,7 @@ void PG_RuntimeUpdate(void)
 {
 #if defined(configGENERATE_RUN_TIME_STATS) && (configGENERATE_RUN_TIME_STATS == 1) && \
     defined(configUSE_TRACE_FACILITY) && (configUSE_TRACE_FACILITY == 1)
-    TaskStatus_t stats[10];
+    static TaskStatus_t stats[10];
     uint32_t total = 0;
     static uint32_t priorTotal = 0;
     static uint32_t prior[5] = {0};
@@ -1026,6 +1175,153 @@ static void pg_stat(PG_Stats *s, float value, volatile float *variance)
 
 
 
+/* ======== KALMAN STEP RESPONSE TEST ========
+ * A manual, fixed-duration tilt approximates a step input.  We sample in
+ * SensorTask (100 Hz), not in RenderTask (30 Hz). No UART work during capture.
+ * t=0 is the first raw sample > 6 degrees from the steady baseline.
+ * For both raw and filtered signal we measure time to 90% of the measured
+ * final RAW tilt. Their difference estimates filter lag independently of
+ * how quickly a human tilts the board.
+ */
+typedef struct {
+    uint32_t tick;
+    float raw;
+    float filtered;
+} PG_StepPoint;
+static PG_StepPoint pgStepTrace[PG_STEP_CAPTURE_SAMPLES];
+static uint32_t pgStepWarmupCount = 0U, pgStepBaselineCount = 0U;
+static float pgStepSumRawRoll = 0.0f, pgStepSumRawPitch = 0.0f;
+static float pgStepSumFiltRoll = 0.0f, pgStepSumFiltPitch = 0.0f;
+static float pgStepBaseRawRoll = 0.0f, pgStepBaseRawPitch = 0.0f;
+static float pgStepBaseFiltRoll = 0.0f, pgStepBaseFiltPitch = 0.0f;
+
+static void pg_step_reset(void)
+{
+    pgStepWarmupCount = pgStepBaselineCount = 0U;
+    pgStepSumRawRoll = pgStepSumRawPitch = 0.0f;
+    pgStepSumFiltRoll = pgStepSumFiltPitch = 0.0f;
+    pgStepStatus = 0U;
+    pgStepAxis = 0U;
+    pgStepError = 0U;
+    pgStepSamples = 0U;
+    pgStepRawT90Ms = pgStepFilteredT90Ms = 0U;
+    pgStepLagMs = 0;
+    pgStepAmplitudeDeg = 0.0f;
+    pgStepResetRequest = 0U;
+}
+
+static int pg_step_crossed(float value, float start, float target)
+{
+    return (target >= start) ? (value >= target) : (value <= target);
+}
+
+static void pg_step_finish(void)
+{
+    const uint32_t n = pgStepSamples;
+    const uint32_t start = n - PG_STEP_PLATEAU_SAMPLES;
+    float sum = 0.0f;
+    float minimum = pgStepTrace[start].raw;
+    float maximum = minimum;
+    for (uint32_t i = start; i < n; ++i) {
+        float v = pgStepTrace[i].raw;
+        sum += v;
+        if (v < minimum) minimum = v;
+        if (v > maximum) maximum = v;
+    }
+    const float finalRaw = sum / (float)PG_STEP_PLATEAU_SAMPLES;
+    const float baselineRaw = (pgStepAxis == 1U) ?
+        pgStepBaseRawRoll : pgStepBaseRawPitch;
+    const float baselineFiltered = (pgStepAxis == 1U) ?
+        pgStepBaseFiltRoll : pgStepBaseFiltPitch;
+    const float amplitude = finalRaw - baselineRaw;
+    pgStepAmplitudeDeg = amplitude;
+    if (fabsf(amplitude) < PG_STEP_MIN_AMPLITUDE_DEG) {
+        pgStepError = 1U;
+        pgStepStatus = 4U;
+        return;
+    }
+    if ((maximum - minimum) > PG_STEP_PLATEAU_SPAN_DEG) {
+        pgStepError = 2U;
+        pgStepStatus = 4U;
+        return;
+    }
+    const float raw90 = baselineRaw + 0.9f * amplitude;
+    const float filtered90 = baselineFiltered + 0.9f * amplitude;
+    int32_t rawIndex = -1, filtIndex = -1;
+    for (uint32_t i = 0U; i < n; ++i) {
+        if (rawIndex < 0 && pg_step_crossed(pgStepTrace[i].raw,
+                                            baselineRaw, raw90))
+            rawIndex = (int32_t)i;
+        if (filtIndex < 0 && pg_step_crossed(pgStepTrace[i].filtered,
+                                             baselineFiltered, filtered90))
+            filtIndex = (int32_t)i;
+    }
+    if (rawIndex < 0 || filtIndex < 0) {
+        pgStepError = 3U;
+        pgStepStatus = 4U;
+        return;
+    }
+    const uint32_t tickHz = osKernelGetTickFreq();
+    if (!tickHz) {
+        pgStepError = 3U;
+        pgStepStatus = 4U;
+        return;
+    }
+    const uint32_t t0 = pgStepTrace[0].tick;
+    const uint32_t rawDt = pgStepTrace[rawIndex].tick - t0;
+    const uint32_t filtDt = pgStepTrace[filtIndex].tick - t0;
+    pgStepRawT90Ms = (uint32_t)((uint64_t)rawDt * 1000U / tickHz);
+    pgStepFilteredT90Ms = (uint32_t)((uint64_t)filtDt * 1000U / tickHz);
+    pgStepLagMs = (int32_t)pgStepFilteredT90Ms - (int32_t)pgStepRawT90Ms;
+    pgStepStatus = 3U;
+}
+
+static void pg_step_measure(const PG_Tilt *tilt)
+{
+    if (pgStepResetRequest != 0U) pg_step_reset();
+    if (pgStepStatus >= 3U) return;  /* Hold completed trial until reset. */
+
+    if (pgStepStatus == 0U) {
+        if (pgStepWarmupCount < PG_STEP_SETTLE_SAMPLES) {
+            ++pgStepWarmupCount;
+            return;
+        }
+        pgStepSumRawRoll += tilt->rawRoll;
+        pgStepSumRawPitch += tilt->rawPitch;
+        pgStepSumFiltRoll += tilt->roll;
+        pgStepSumFiltPitch += tilt->pitch;
+        if (++pgStepBaselineCount == PG_STEP_BASELINE_SAMPLES) {
+            pgStepBaseRawRoll = pgStepSumRawRoll / PG_STEP_BASELINE_SAMPLES;
+            pgStepBaseRawPitch = pgStepSumRawPitch / PG_STEP_BASELINE_SAMPLES;
+            pgStepBaseFiltRoll = pgStepSumFiltRoll / PG_STEP_BASELINE_SAMPLES;
+            pgStepBaseFiltPitch = pgStepSumFiltPitch / PG_STEP_BASELINE_SAMPLES;
+            pgStepStatus = 1U;
+        }
+        return;
+    }
+
+    if (pgStepStatus == 1U) {
+        float rollChange = tilt->rawRoll - pgStepBaseRawRoll;
+        float pitchChange = tilt->rawPitch - pgStepBaseRawPitch;
+        if (fabsf(rollChange) < PG_STEP_TRIGGER_DEG &&
+            fabsf(pitchChange) < PG_STEP_TRIGGER_DEG)
+            return;
+        pgStepAxis = (fabsf(rollChange) >= fabsf(pitchChange)) ? 1U : 2U;
+        pgStepStatus = 2U;
+        pgStepSamples = 0U;
+    }
+
+    if (pgStepStatus == 2U) {
+        const uint32_t n = pgStepSamples;
+        if (n >= PG_STEP_CAPTURE_SAMPLES) return;
+        pgStepTrace[n].tick = tilt->tick;
+        pgStepTrace[n].raw = (pgStepAxis == 1U) ? tilt->rawRoll : tilt->rawPitch;
+        pgStepTrace[n].filtered = (pgStepAxis == 1U) ? tilt->roll : tilt->pitch;
+        pgStepSamples = n + 1U;
+        if (pgStepSamples == PG_STEP_CAPTURE_SAMPLES) pg_step_finish();
+    }
+}
+
 static char pgScreen[PG_H][PG_W];
 static char pgPrevious[PG_H][PG_W];
 static char pgTx[4096]; /* static: DMA uses it until TxCpltCallback */
@@ -1059,11 +1355,11 @@ static void pg_draw(const PG_View *v)
     for (unsigned y = 3; y <= 21; y++) {
         pgScreen[y][24] = '|';
         pgScreen[y][56] = '|';
-        if (((y + v->frame / 2U) % 5U) < 3U) {
+        if (((y + v->roadOffset / 2U) % 5U) < 3U) {
             pgScreen[y][35] = ':';
             pgScreen[y][46] = ':';
         }
-        if (((y + v->frame) % 7U) == 0) {
+        if (((y + v->roadOffset) % 7U) == 0) {
             pgScreen[y][12] = '.';
             pgScreen[y][65] = '*';
         }
@@ -1074,8 +1370,8 @@ static void pg_draw(const PG_View *v)
         PG_Car c = v->traffic[i];
         if (c.y >= 3 && c.y <= 21 && c.x >= 26 && c.x <= 54) {
             pgScreen[(unsigned)c.y][(unsigned)c.x] = c.kind == 1 ? 'V' : 'X';
-            if (c.x > 26) pgScreen[(unsigned)c.y][(unsigned)c.x - 1] = '[';
-            if (c.x < 54) pgScreen[(unsigned)c.y][(unsigned)c.x + 1] = ']';
+            pgScreen[(unsigned)c.y][(unsigned)c.x - 1] = '[';
+            pgScreen[(unsigned)c.y][(unsigned)c.x + 1] = ']';
         }
     }
     if (v->ghostX >= 26 && v->ghostX <= 54 &&
@@ -1105,7 +1401,16 @@ static void pg_draw(const PG_View *v)
     pg_write(21, 1, "H:%lX S:%02X A:%06lX", (unsigned long)pgFlashHalError,
              (unsigned)pgFlashStatus, (unsigned long)pgFlashAddress);
     pg_write(22, 0, "Tilt the board to steer and accelerate. Avoid oncoming traffic!");
-    if (mode == PG_MENU) pg_write(23, 0, "Press USER to start a new run.");
+    if (mode == PG_MENU) {
+        if (pgRecordsResetState == 1U)
+            pg_write(23, 0, "Clearing scores and ghost in QSPI - please keep powered on...");
+        else if (pgRecordsResetState == 2U)
+            pg_write(23, 0, "Records cleared and saved. Press USER to start.");
+        else if (pgRecordsResetState == 3U)
+            pg_write(23, 0, "Record reset failed - inspect FLASH and QSPI diagnostics.");
+        else
+            pg_write(23, 0, "USER: tap to start | hold 3 seconds to clear scores + ghost.");
+    }
     else if (mode == PG_PAUSED) pg_write(23, 0, "PAUSED - press USER to resume.");
     else if (mode == PG_GAME_OVER) pg_write(23, 0,
                   "CRASH - press USER for best-run ghost replay (or new run).");
@@ -2324,6 +2629,7 @@ void sensorTask1(void *argument)
                 pg_stat(&statsRF, t.roll, &pgRollFilteredVariance);
                 pg_stat(&statsPR, t.rawPitch, &pgPitchRawVariance);
                 pg_stat(&statsPF, t.pitch, &pgPitchFilteredVariance);
+                pg_step_measure(&t); /* One-shot, no extra I2C/UART traffic. */
                 if (osMessageQueuePut(pgTiltQueue, &t, 0, 0) != osOK) {
                     PG_Tilt old;
                     (void)osMessageQueueGet(pgTiltQueue, &old, NULL, 0);
@@ -2354,25 +2660,71 @@ void gameTask1(void *argument)
     (void)argument;
     PG_Tilt tilt = {0};
     uint32_t next = osKernelGetTickCount(), fraction = 0, buttonAt = 0;
-    uint32_t ledOffAt = 0;
+    uint32_t menuPressAt = 0U;
+    uint8_t menuPressActive = 0U, menuHoldHandled = 0U;
+    uint32_t ledBlinkStart = 0U;
+    uint8_t ledBlinkActive = 0U;
     PG_Mode previousMode = PG_MENU;
     for (;;) {
         PG_TRACE_BEGIN(Game);
         PG_Tilt in;
         while (osMessageQueueGet(pgTiltQueue, &in, NULL, 0) == osOK) tilt = in;
         uint32_t now = osKernelGetTickCount();
-        int clicked = osSemaphoreAcquire(pgButtonSemaphore, 0) == osOK &&
-                      (uint32_t)(now - buttonAt) >= osKernelGetTickFreq()/5U;
+        /* PC13 USER is active-low. The configured rising-edge EXTI arrives
+         * on RELEASE, so MENU detects a hold by reading the pin directly.
+         * A short press (or very short release-only edge) still starts play. */
+        int edge = (osSemaphoreAcquire(pgButtonSemaphore, 0U) == osOK);
+        int clicked = 0;
+        if (pgView.mode == PG_MENU) {
+            GPIO_PinState buttonLevel = HAL_GPIO_ReadPin(
+                BUTTON_EXTI13_GPIO_Port, BUTTON_EXTI13_Pin);
+            int pressed = (buttonLevel == GPIO_PIN_RESET);
+            if (pressed && !menuPressActive && !menuHoldHandled) {
+                menuPressActive = 1U;
+                menuPressAt = now;
+            } else if (pressed && menuPressActive) {
+                uint32_t heldMs = (uint32_t)(
+                    (uint64_t)(now - menuPressAt) * 1000U / osKernelGetTickFreq());
+                if (heldMs >= PG_RESET_HOLD_MS) {
+                    menuPressActive = 0U;
+                    menuHoldHandled = 1U; /* consume the eventual release */
+                    if (pgFlashReady && pgRecordsResetState != 1U) {
+                        uint8_t request = 2U;
+                        if (osMessageQueuePut(pgSaveQueue, &request, 0U, 0U) == osOK)
+                            pgRecordsResetState = 1U;
+                        else
+                            pgRecordsResetState = 3U;
+                    } else if (!pgFlashReady) {
+                        pgRecordsResetState = 3U;
+                    }
+                }
+            } else if (!pressed) {
+                if (menuPressActive || (edge && !menuHoldHandled))
+                    clicked = 1;
+                menuPressActive = 0U;
+                menuHoldHandled = 0U;
+            }
+            if (pgRecordsResetState == 1U) clicked = 0;
+        } else {
+            menuPressActive = 0U;
+            menuHoldHandled = 0U;
+            clicked = edge;
+        }
+        if (clicked && (uint32_t)(now - buttonAt) <
+                       osKernelGetTickFreq() / 5U) clicked = 0;
         if (clicked) buttonAt = now;
         if (osMutexAcquire(pgViewMutex, osWaitForever) == osOK) {
             if (clicked) {
                 if (pgView.mode == PG_MENU) {
                     PG_GameReset(&pgView, now ^ 0x91B8F203U, PG_RUNNING);
+                    pgRecordsResetState = 0U;
                     pgCurrentCount = 0; pgCurrentHash = 2166136261UL;
                 } else if (pgView.mode == PG_RUNNING) pgView.mode = PG_PAUSED;
                 else if (pgView.mode == PG_PAUSED) pgView.mode = PG_RUNNING;
                 else if (pgView.mode == PG_GAME_OVER) {
                     if (pgCurrentSave.bestLength > 0) {
+                        pgReplayMovesEncoded = PG_ReplayHasMoveFlags(
+                            pgCurrentSave.positions, pgCurrentSave.bestLength);
                         PG_GameReset(&pgView, pgCurrentSave.bestSeed, PG_REPLAY);
                         pgCurrentHash = 2166136261UL;
                     } else {
@@ -2398,15 +2750,18 @@ void gameTask1(void *argument)
                 /* Overlay the recorded best-run car during ordinary play. */
                 if (previousMode == PG_RUNNING && pgView.frame != 0U &&
                     pgView.frame <= pgCurrentSave.bestLength)
-                    pgView.ghostX = pgCurrentSave.positions[pgView.frame - 1U];
+                    pgView.ghostX = (int8_t)(
+                        (uint8_t)pgCurrentSave.positions[pgView.frame - 1U] & 0x7FU);
                 else if (previousMode == PG_RUNNING)
                     pgView.ghostX = -1;
             }
             if (previousMode == PG_RUNNING && pgView.mode == PG_GAME_OVER) {
                 uint8_t crash = PG_FX_CRASH;
                 (void)osMessageQueuePut(pgSoundQueue, &crash, 0, 0);
+                /* Three visible LED2 flashes: 200 ms on, 200 ms off. */
+                ledBlinkStart = now;
+                ledBlinkActive = 1U;
                 HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET);
-                ledOffAt = now + osKernelGetTickFreq()/3U;
                 (void)osMutexAcquire(pgSaveMutex, osWaitForever);
                 uint32_t oldTop = pgCurrentSave.scores[0];
                 PG_InsertScore(pgCurrentSave.scores, pgView.score);
@@ -2428,9 +2783,17 @@ void gameTask1(void *argument)
                 if (pgCurrentHash != pgCurrentSave.bestRunHash) ++pgReplayMismatch;
                 pgView.replayMismatch = pgReplayMismatch;
             }
-            if (ledOffAt && (int32_t)(now - ledOffAt) >= 0) {
-                HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET);
-                ledOffAt = 0;
+            if (ledBlinkActive) {
+                uint32_t elapsedMs = (uint32_t)(((uint64_t)(now - ledBlinkStart) * 1000U)
+                                                / osKernelGetTickFreq());
+                if (elapsedMs >= 1200U) {
+                    HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET);
+                    ledBlinkActive = 0U;
+                } else {
+                    GPIO_PinState level = ((elapsedMs / 200U) % 2U == 0U)
+                                        ? GPIO_PIN_SET : GPIO_PIN_RESET;
+                    HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, level);
+                }
             }
             pgView.flashOk = pgFlashReady;
             pgAudioSpeed = (pgView.mode == PG_RUNNING || pgView.mode == PG_REPLAY)
@@ -2534,30 +2897,64 @@ void storageTask1(void *argument)
         uint8_t request;
         if (osMessageQueueGet(pgSaveQueue, &request, NULL, osWaitForever) != osOK)
             continue;
-        if (request != 1 || !pgFlashReady) continue;
-        /* Collision SFX lasts 128 ms. Allow time for AudioTask to see event. */
-        osDelay(50);
-        uint32_t started = osKernelGetTickCount();
-        while (pgEffectRemaining &&
-               osKernelGetTickCount() - started < 2U * osKernelGetTickFreq())
-            osDelay(10);
+        if (request != 1U && request != 2U) continue;
+        if (!pgFlashReady) {
+            if (request == 2U) pgRecordsResetState = 3U;
+            continue;
+        }
+        if (request == 1U) {
+            /* Collision SFX lasts 128 ms. Avoid interrupting flash audio. */
+            osDelay(50U);
+            uint32_t started = osKernelGetTickCount();
+            while (pgEffectRemaining &&
+                   osKernelGetTickCount() - started < 2U * osKernelGetTickFreq())
+                osDelay(10U);
+        }
         PG_TRACE_BEGIN(Storage);
-        if (osMutexAcquire(pgSaveMutex, osWaitForever) == osOK) {
+        if (request == 2U) {
+            /* New empty CRC-protected record. Old valid slot remains as a
+             * power-loss fallback until the new record is verified. No chip
+             * erase and no effect-bank erase are performed. */
+            memset(&pgStorageSnapshot, 0, sizeof(pgStorageSnapshot));
+        } else if (osMutexAcquire(pgSaveMutex, osWaitForever) == osOK) {
             pgStorageSnapshot = pgCurrentSave;
             (void)osMutexRelease(pgSaveMutex);
         }
-        /* Serialize flash mode transitions and protect against AudioTask reads. */
+        int writeOk = 0;
+        /* Serialize flash mode transitions and protect AudioTask reads. */
         if (osMutexAcquire(pgFlashMutex, osWaitForever) == osOK) {
             if (!PG_FlashUnmap()) {
                 ++pgFlashErrors;
             } else {
-                pgFlashMapped = 0;
-                if (PG_FlashWriteBest(&pgStorageSnapshot)) ++pgSavedGames;
-                else ++pgFlashErrors;
-                if (PG_FlashMap()) pgFlashMapped = 1;
-                else { pgFlashReady = 0; ++pgFlashErrors; }
+                pgFlashMapped = 0U;
+                if (PG_FlashWriteBest(&pgStorageSnapshot)) {
+                    ++pgSavedGames;
+                    writeOk = 1;
+                } else ++pgFlashErrors;
+                if (PG_FlashMap()) pgFlashMapped = 1U;
+                else { pgFlashReady = 0U; ++pgFlashErrors; }
             }
             (void)osMutexRelease(pgFlashMutex);
+        }
+        if (request == 2U) {
+            if (writeOk && pgFlashReady) {
+                if (osMutexAcquire(pgSaveMutex, osWaitForever) == osOK) {
+                    pgCurrentSave = pgStorageSnapshot;
+                    (void)osMutexRelease(pgSaveMutex);
+                }
+                if (osMutexAcquire(pgViewMutex, osWaitForever) == osOK) {
+                    memset(pgView.scores, 0, sizeof(pgView.scores));
+                    pgView.ghostAvailable = 0U;
+                    pgView.ghostFrameCount = 0U;
+                    pgView.ghostX = -1;
+                    pgCurrentCount = 0U;
+                    pgCurrentHash = 2166136261UL;
+                    (void)osMutexRelease(pgViewMutex);
+                }
+                pgRecordsResetState = 2U;
+            } else {
+                pgRecordsResetState = 3U;
+            }
         }
         PG_TRACE_END(Storage);
     }
